@@ -1,0 +1,191 @@
+name: Build Basement Scramjet runtime ZIP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out Scramjet source and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Scramjet WebAssembly build tools
+        uses: ./.github/actions/setup-rewriter-toolchain
+        with:
+          wasm-bindgen-version: "0.2.105"
+          rewriter-path: packages/core/rewriter
+          github-token: ${{ github.token }}
+
+      - name: Build Scramjet core (includes WebAssembly)
+        run: pnpm pack
+        working-directory: packages/core
+
+      - name: Build Scramjet controller
+        run: pnpm pack
+        working-directory: packages/controller
+
+      - name: Build Scramjet utilities
+        run: pnpm pack
+        working-directory: packages/utils
+
+      - name: Assemble only the files needed by Basement
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/basement-runtime"
+          mkdir -p "$OUT/scram" "$OUT/controller" "$OUT/utils" "$OUT/libcurl"
+
+          cp packages/core/dist/scramjet.js "$OUT/scram/scramjet.js"
+          cp packages/core/dist/scramjet.wasm "$OUT/scram/scramjet.wasm"
+          cp packages/controller/dist/controller.api.js "$OUT/controller/controller.api.js"
+          cp packages/controller/dist/controller.inject.js "$OUT/controller/controller.inject.js"
+          cp packages/controller/dist/controller.sw.js "$OUT/controller/controller.sw.js"
+          cp packages/utils/dist/scramjet-utils.js "$OUT/utils/scramjet-utils.js"
+
+          # The Scramjet workspace installs this exact pinned transport for its demo/bootstrap.
+          LIBCURL="packages/demo/node_modules/@mercuryworkshop/libcurl-transport/dist/index.js"
+          test -s "$LIBCURL"
+          cp "$LIBCURL" "$OUT/libcurl/index.js"
+
+          cat > "$OUT/sw.js" <<'SW'
+          importScripts('/controller/controller.sw.js');
+          self.addEventListener('fetch', (event) => {
+            if (self.$scramjetController.shouldRoute(event)) {
+              event.respondWith(self.$scramjetController.route(event));
+            }
+          });
+          self.addEventListener('install', () => self.skipWaiting());
+          self.addEventListener('activate', (event) => {
+            event.waitUntil(self.clients.claim());
+          });
+          SW
+
+          cat > "$OUT/scramjet/config.js" <<'CONFIG'
+          // Add your own secure Wisp endpoint later. This build uses Libcurl only.
+          window.BASEMENT_SCRAMJET_CONFIG = Object.freeze({
+            wisp: '',
+            transport: 'libcurl',
+            versions: Object.freeze({
+              scramjet: '2.0.67-alpha.2',
+              controller: '0.0.14',
+              utils: '0.0.3',
+              libcurl: '2.0.5'
+            })
+          });
+          CONFIG
+
+          cat > "$OUT/scramjet/engine.js" <<'ENGINE'
+          /* Basement adapter for the pinned Scramjet 2.x runtime. */
+          const ASSETS = {
+            core: '/scram/scramjet.js',
+            controller: '/controller/controller.api.js',
+            utils: '/utils/scramjet-utils.js',
+            wasm: '/scram/scramjet.wasm',
+            inject: '/controller/controller.inject.js',
+            serviceWorker: '/sw.js',
+            libcurl: '/libcurl/index.js'
+          };
+          function loadScript(src) {
+            return new Promise((resolve, reject) => {
+              if ([...document.scripts].some(s => s.dataset.sjSrc === src)) return resolve();
+              const script = document.createElement('script');
+              script.src = src;
+              script.dataset.sjSrc = src;
+              script.onload = resolve;
+              script.onerror = () => reject(new Error('Failed to load ' + src));
+              document.head.appendChild(script);
+            });
+          }
+          let bootPromise;
+          window.basementScramjetReady = function () {
+            if (bootPromise) return bootPromise;
+            bootPromise = (async () => {
+              if (!('serviceWorker' in navigator)) throw new Error('Service workers require HTTPS and browser support.');
+              const registration = await navigator.serviceWorker.register(ASSETS.serviceWorker, { scope: '/', updateViaCache: 'none' });
+              await navigator.serviceWorker.ready;
+              if (!navigator.serviceWorker.controller) {
+                await new Promise((resolve, reject) => {
+                  const timeout = setTimeout(() => reject(new Error('Reload once to activate the Scramjet service worker.')), 12000);
+                  navigator.serviceWorker.addEventListener('controllerchange', () => { clearTimeout(timeout); resolve(); }, { once: true });
+                  if (navigator.serviceWorker.controller) { clearTimeout(timeout); resolve(); }
+                });
+              }
+              const sw = navigator.serviceWorker.controller || registration.active;
+              if (!sw) throw new Error('Scramjet service worker is not active.');
+              await loadScript(ASSETS.core);
+              await loadScript(ASSETS.controller);
+              await loadScript(ASSETS.utils);
+              await loadScript(ASSETS.libcurl);
+              const api = window.$scramjetController;
+              const transportAPI = window.LibcurlTransport;
+              if (!api?.Controller || !transportAPI?.LibcurlClient) throw new Error('Scramjet or Libcurl runtime globals are missing.');
+              if (api.assertRuntimeScramjetVersion) api.assertRuntimeScramjetVersion();
+              const cfg = window.BASEMENT_SCRAMJET_CONFIG || {};
+              const wisp = String(cfg.wisp || '').trim();
+              if (!/^wss:\/\//i.test(wisp) || !wisp.endsWith('/')) throw new Error('Add your secure Wisp URL in /scramjet/config.js before using external navigation.');
+              const controller = new api.Controller({
+                serviceworker: sw,
+                transport: new transportAPI.LibcurlClient({ wisp }),
+                config: { prefix: '/scramjet/', scramjetPath: ASSETS.core, wasmPath: ASSETS.wasm, injectPath: ASSETS.inject }
+              });
+              await controller.wait();
+              const iframe = document.getElementById('frame');
+              if (!iframe) throw new Error('Basement iframe #frame was not found.');
+              const frame = controller.createFrame(iframe);
+              window.__basementScramjetController = controller;
+              window.__basementScramjetFrame = frame;
+              return frame;
+            })().catch(error => { bootPromise = null; throw error; });
+            return bootPromise;
+          };
+          window.basementScramjetGo = async function (url) {
+            const frame = await window.basementScramjetReady();
+            frame.go(url);
+            return true;
+          };
+          ENGINE
+
+          # Fail the build rather than emitting a misleading partial ZIP.
+          for file in \
+            "$OUT/scram/scramjet.js" \
+            "$OUT/scram/scramjet.wasm" \
+            "$OUT/controller/controller.api.js" \
+            "$OUT/controller/controller.inject.js" \
+            "$OUT/controller/controller.sw.js" \
+            "$OUT/utils/scramjet-utils.js" \
+            "$OUT/libcurl/index.js" \
+            "$OUT/sw.js" \
+            "$OUT/scramjet/config.js" \
+            "$OUT/scramjet/engine.js"; do
+            test -s "$file" || { echo "Missing required asset: $file"; exit 1; }
+          done
+
+          cd "$OUT"
+          zip -qr "$GITHUB_WORKSPACE/basement-scramjet-runtime.zip" .
+
+      - name: Upload complete runtime ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: basement-scramjet-runtime
+          path: basement-scramjet-runtime.zip
+          if-no-files-found: error
+          retention-days: 7
