@@ -52,7 +52,7 @@ jobs:
         run: |
           set -euo pipefail
           OUT="$GITHUB_WORKSPACE/basement-runtime"
-          mkdir -p "$OUT/scram" "$OUT/controller" "$OUT/utils" "$OUT/libcurl"
+          mkdir -p "$OUT/scram" "$OUT/controller" "$OUT/utils" "$OUT/libcurl" "$OUT/scramjet"
 
           cp packages/core/dist/scramjet.js "$OUT/scram/scramjet.js"
           cp packages/core/dist/scramjet.wasm "$OUT/scram/scramjet.wasm"
